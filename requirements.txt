@@ -1,0 +1,7 @@
+playwright
+openai
+beautifulsoup4
+lxml
+pdfplumber
+dnspython
+python-dotenv

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtualenv
+venv/
+.venv/
+
+# Secrets
+.env
+
+# Runtime outputs
+output_*.csv
+demo_*.csv
+test_*.csv
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/
