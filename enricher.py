@@ -18,16 +18,53 @@ def is_stem_teacher(teacher: dict) -> bool:
     dept = (teacher.get("department") or "").lower()
     bio = (teacher.get("bio") or "").lower()
     source_url = (teacher.get("source_url") or "").lower()
+    page_subject_hint = (teacher.get("page_subject_hint") or "").lower()
 
-    combined = f"{role} {dept} {bio} {source_url}"
+    role_dept_bio = f"{role} {dept} {bio}"
+    combined = f"{role_dept_bio} {source_url} {page_subject_hint}"
+    educator_terms = [
+        "teacher", "educator", "faculty", "instructor", "professor",
+        "specialist", "coach", "department", "curriculum", "classroom",
+    ]
+    has_educator_signal = any(term in role_dept_bio for term in educator_terms)
 
+    strong_keywords = {
+        "math", "mathematics", "algebra", "geometry", "calculus",
+        "trigonometry", "statistics", "pre-calculus", "precalculus",
+        "science", "biology", "chemistry", "physics", "earth science",
+        "environmental science", "life science", "physical science",
+        "anatomy", "physiology", "ecology", "geology", "astronomy",
+    }
+    broad_keywords = {
+        "stem", "steam", "engineering", "computer science", "robotics",
+        "technology", "coding", "programming", "information technology",
+        "tech ed", "data science", "cyber", "makerspace",
+    }
+
+    for keyword in strong_keywords:
+        if keyword in role_dept_bio:
+            return True
+
+    for keyword in broad_keywords:
+        if keyword in role_dept_bio and has_educator_signal:
+            return True
+
+    if page_subject_hint in {"math", "science", "stem"}:
+        # Pages that are clearly subject-specific can provide subject context
+        # when role data is sparse.
+        if has_educator_signal or not role.strip():
+            return True
+
+    # Fallback to original keyword set against all fields for edge cases.
     for keyword in config.STEM_KEYWORDS:
         keyword = keyword.lower()
         if " " in keyword or "/" in keyword or "-" in keyword:
-            if keyword in combined:
+            if keyword in combined and (has_educator_signal or keyword in strong_keywords):
                 return True
         elif re.search(rf"\b{re.escape(keyword)}\b", combined):
-            return True
+            if has_educator_signal or keyword in strong_keywords:
+                return True
+
     return False
 
 
