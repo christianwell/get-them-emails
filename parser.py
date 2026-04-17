@@ -171,11 +171,230 @@ def _regex_parse_staff(text: str) -> list[dict]:
                 else:
                     break
 
-            if person.get('name'):
+            role_text = (person.get("role") or "").lower()
+            has_contact_signal = bool(person.get("email") or person.get("phone"))
+            has_role_signal = bool(re.search(
+                r"\b(teacher|principal|assistant principal|counselor|director|"
+                r"coordinator|specialist|librarian|psychologist|nurse|coach|"
+                r"instructor|professor|educator|interventionist|paraeducator|"
+                r"administrator|dean|secretary)\b",
+                role_text,
+            ))
+
+            # Avoid treating nav headings and document titles as people rows.
+            if person.get('name') and (has_contact_signal or has_role_signal):
                 staff.append(person)
         else:
             i += 1
 
+    return staff
+
+
+def _parse_labeled_directory_rows(text: str) -> list[dict]:
+    """Parse directories that use repeated Name/Titles/Locations/Email labels."""
+    email_re = config.EMAIL_REGEX
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    people: list[dict] = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        if not _is_likely_person_name(line):
+            i += 1
+            continue
+
+        # Look ahead for the labeled pattern used in many district directories.
+        window = lines[i + 1:i + 8]
+        joined = " ".join(window).lower()
+        if "titles:" not in joined or "email" not in joined:
+            i += 1
+            continue
+
+        person: dict = {"name": line}
+        j = i + 1
+        consumed = 0
+        while j < len(lines) and consumed < 8:
+            current = lines[j].strip()
+            current_lower = current.lower()
+
+            if current_lower.startswith("titles:"):
+                person["role"] = current.split(":", 1)[1].strip()
+            elif current_lower.startswith("locations:"):
+                person["department"] = current.split(":", 1)[1].strip()
+            elif current_lower.startswith("email:"):
+                email_inline = re.search(email_re, current)
+                if email_inline:
+                    person["email"] = email_inline.group().lower()
+            else:
+                email_match = re.search(email_re, current)
+                if email_match and not person.get("email"):
+                    person["email"] = email_match.group().lower()
+                    # End of this row in labeled directories.
+                    j += 1
+                    break
+
+                # Start of next person row.
+                if consumed >= 1 and _is_likely_person_name(current):
+                    break
+
+            j += 1
+            consumed += 1
+
+        if person.get("email") or person.get("role"):
+            people.append(person)
+            i = j
+            continue
+
+        i += 1
+
+    return people
+
+
+def _is_likely_person_name(name: str) -> bool:
+    words = [w for w in name.strip().split() if w]
+    if len(words) < 2 or len(words) > 5:
+        return False
+    if len(name) < 5 or len(name) > 60:
+        return False
+    if any(ch.isdigit() for ch in name):
+        return False
+    lowered = name.lower()
+    bad_fragments = [
+        "directory", "staff", "faculty", "department", "school",
+        "district", "instruction", "contact", "search", "start over",
+        "home", "email address", "office phone",
+        "powerteacher", "powerschool", "schoolmessenger", "acceptable use",
+        "agreement", "current topics", "score", "gradebook", "grading",
+        "how to", "set up", "setup", "print", "reports", "help guides",
+        "teacher help", "standards based", "recalculate",
+    ]
+    if any(fragment in lowered for fragment in bad_fragments):
+        return False
+    if not re.match(r"^[A-Za-z][A-Za-z\.\-\'\,\s]+$", name):
+        return False
+
+    # Require at least two alphabetic name-like tokens.
+    clean_tokens = [t.strip(".,") for t in words]
+    alpha_tokens = [t for t in clean_tokens if re.match(r"^[A-Za-z][A-Za-z'\-]*$", t)]
+    if len(alpha_tokens) < 2:
+        return False
+    uppercase_starts = sum(
+        1 for token in alpha_tokens
+        if token and token[0].isupper()
+    )
+    if uppercase_starts < 2:
+        return False
+    return True
+
+
+def _is_noise_staff_row(person: dict) -> bool:
+    """Drop rows that look like page chrome/help content, not actual people."""
+    name = (person.get("name") or "").strip()
+    role = (person.get("role") or "").strip()
+    department = (person.get("department") or "").strip()
+    email = (person.get("email") or "").strip().lower()
+
+    if not _is_likely_person_name(name):
+        return True
+
+    combined = f"{name} {role} {department}".lower()
+    noise_terms = [
+        "powerteacher", "powerschool", "schoolmessenger", "acceptable use",
+        "how to", "help guide", "teacher help", "gradebook", "grading",
+        "reports", "scoresheet", "current topics", "setup", "set up",
+    ]
+    if any(term in combined for term in noise_terms):
+        return True
+
+    if not role:
+        name_words = name.split()
+        if len(name_words) > 3:
+            return True
+        if any(
+            token in name.lower()
+            for token in [
+                "attend", "annual", "breakdown", "wellness",
+                "health fair", "understanding", "where", "how to",
+                "category", "standards", "screen size", "current topics",
+                "recalculate", "finalizing", "acceptable use",
+            ]
+        ):
+            return True
+
+    # Tutorial pages often fabricate dot-separated email locals; reject them.
+    if email:
+        local = email.split("@")[0]
+        if local.count(".") >= 2 and not role:
+            return True
+
+    return False
+
+
+def _sanitize_staff_rows(staff: list[dict]) -> list[dict]:
+    cleaned = []
+    for person in staff:
+        if _is_noise_staff_row(person):
+            continue
+        cleaned.append(person)
+    return cleaned
+
+
+def _is_high_quality_regex_result(staff: list[dict]) -> bool:
+    """Reject low-quality regex parses that are mostly page chrome/content."""
+    if not staff:
+        return False
+
+    name_like = sum(1 for person in staff if _is_likely_person_name(person.get("name", "")))
+    with_email_or_phone = sum(
+        1 for person in staff
+        if person.get("email") or person.get("phone")
+    )
+    with_role = sum(
+        1 for person in staff
+        if person.get("role") and len((person.get("role") or "").strip()) >= 3
+    )
+    total = len(staff)
+
+    # Small directories can pass with one strongly structured match.
+    if total <= 3:
+        return name_like >= 1 and (with_email_or_phone >= 1 or with_role >= 1)
+
+    if name_like / total < 0.7:
+        return False
+    if with_email_or_phone >= 2:
+        return True
+    if with_role / total >= 0.4:
+        return True
+    return False
+
+
+def _detect_page_subject_hint(text: str, page_url: str) -> str | None:
+    """Infer a STEM subject context from page text/url for empty-role rows."""
+    combined = f"{text[:12000]} {page_url}".lower()
+    subject_aliases = {
+        "math": ["math", "mathematics", "algebra", "calculus"],
+        "science": ["science", "biology", "chemistry", "physics"],
+        "stem": ["stem", "steam", "engineering", "robotics", "computer science"],
+    }
+
+    matches = set()
+    for label, aliases in subject_aliases.items():
+        if any(alias in combined for alias in aliases):
+            matches.add(label)
+
+    # Only apply when page context is clearly one subject bucket.
+    if len(matches) == 1:
+        return next(iter(matches))
+    return None
+
+
+def _apply_page_subject_hint(staff: list[dict], subject_hint: str | None) -> list[dict]:
+    if not subject_hint:
+        return staff
+    for person in staff:
+        person["page_subject_hint"] = subject_hint
+        if not person.get("department"):
+            person["department"] = subject_hint
     return staff
 
 
@@ -186,21 +405,45 @@ def parse_staff_from_html(html: str, page_url: str = "") -> list[dict]:
     if not text.strip() or len(text.strip()) < 50:
         return []
 
-    # Try fast regex parsing first
+    # Try fast deterministic parsing first for labeled directory UIs.
+    staff = _parse_labeled_directory_rows(text)
+    if staff:
+        staff = _sanitize_staff_rows(staff)
+        subject_hint = _detect_page_subject_hint(text, page_url)
+        staff = _apply_page_subject_hint(staff, subject_hint)
+        if _is_high_quality_regex_result(staff):
+            print(f"    ⚡ Fast-parsed {len(staff)} staff (labeled)")
+            for s in staff[:3]:
+                print(f"       → {s.get('name', '?')} | {s.get('role', '?')} | {s.get('email', '?')}")
+            if len(staff) > 3:
+                print(f"       ... and {len(staff)-3} more")
+            return staff
+        staff = []
+
+    # Try general regex parsing next
     staff = _regex_parse_staff(text)
     if staff:
-        print(f"    ⚡ Fast-parsed {len(staff)} staff (regex)")
-        for s in staff[:3]:
-            print(f"       → {s.get('name', '?')} | {s.get('role', '?')} | {s.get('email', '?')}")
-        if len(staff) > 3:
-            print(f"       ... and {len(staff)-3} more")
-        return staff
+        staff = _sanitize_staff_rows(staff)
+        subject_hint = _detect_page_subject_hint(text, page_url)
+        staff = _apply_page_subject_hint(staff, subject_hint)
+        if not _is_high_quality_regex_result(staff):
+            print(f"    ⚠️  Regex parse looked noisy ({len(staff)} rows), using AI fallback")
+            staff = []
+        else:
+            print(f"    ⚡ Fast-parsed {len(staff)} staff (regex)")
+            for s in staff[:3]:
+                print(f"       → {s.get('name', '?')} | {s.get('role', '?')} | {s.get('email', '?')}")
+            if len(staff) > 3:
+                print(f"       ... and {len(staff)-3} more")
+            return staff
 
     # Fallback to LLM for complex pages
     client = get_ai_client()
     chunks = chunk_text(text)
     all_staff = []
     print(f"    🧹 Cleaned HTML → {len(text)} chars text, {len(chunks)} chunk(s)")
+
+    subject_hint = _detect_page_subject_hint(text, page_url)
 
     for i, chunk in enumerate(chunks):
         print(f"    🤖 Sending chunk {i+1}/{len(chunks)} to AI "
@@ -219,6 +462,8 @@ def parse_staff_from_html(html: str, page_url: str = "") -> list[dict]:
             print(f"    📥 AI response: {len(result)} chars")
             parsed = _parse_json_array(result)
             if parsed:
+                parsed = _sanitize_staff_rows(parsed)
+                parsed = _apply_page_subject_hint(parsed, subject_hint)
                 print(f"    ✅ Parsed {len(parsed)} staff from chunk {i+1}")
                 for s in parsed[:3]:
                     print(f"       → {s.get('name', '?')} | {s.get('role', '?')} | {s.get('email', '?')}")

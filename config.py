@@ -20,7 +20,10 @@ JS_WAIT = 1500  # ms — wait for JS render
 PAGINATION_WAIT = 1200  # ms — lighter wait after pagination navigation
 CRAWL_DELAY = 0.3  # seconds between page loads
 MIN_LINK_SCORE = 8  # only follow links scoring >= this
-MAX_STAFF_LINK_CHECKS = 5  # cap deep staff-link checks per site
+SECONDARY_LINK_SCORE = 6  # broader threshold for discovery crawl
+MAX_STAFF_LINK_CHECKS = 12  # cap deep staff-link checks per site
+MAX_DISCOVERY_VISITS = 24  # cap pages visited while hunting staff directories
+MAX_SITEMAP_FETCHES = 6  # cap sitemap files fetched during discovery
 GOOGLE_RENDER_WAIT = 1000  # ms — wait for search results DOM
 GOOGLE_QUERY_DELAY = 0.5  # sec between Google queries
 
@@ -30,7 +33,26 @@ STAFF_URL_PATTERNS = [
     "/our-staff", "/our-team", "/staff-directory",
     "/about/staff", "/about/faculty",
     "/faculty-staff", "/faculty-and-staff",
-    "/apps/pages/staff-directory",
+    "/apps/pages/staff-directory", "/staff-directory/home",
+    "/staff-directory/search", "/staff-search",
+    "/district/staff-directory", "/schools/staff-directory",
+    "/administration/staff-directory", "/about-us/staff",
+    "/people", "/directory/staff", "/employees/staff-directory",
+    "/site/default.aspx?pagetype=2&domainid=", "/site/default.aspx?pagetype=15",
+]
+
+STAFF_LINK_POSITIVE_HINTS = [
+    "staff", "faculty", "directory", "teacher", "teachers",
+    "employee", "employees", "people", "contact",
+]
+
+STAFF_LINK_NEGATIVE_HINTS = [
+    "calendar", "news", "event", "lunch", "menu", "bus",
+    "parent", "student", "enrollment", "registration",
+    "login", "donate", "careers", "jobs", "apply", "employment",
+    "twitter", "facebook", "instagram", "youtube", "athletics",
+    "board", "trustees", "policy", "procurement", "resources",
+    ".pdf", ".doc", "mailto:", "tel:", "javascript:",
 ]
 
 # STEM subject keywords for filtering teachers

@@ -1,6 +1,7 @@
 import asyncio
+from collections import deque
 import re
-from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse, quote_plus, unquote
 from playwright.async_api import async_playwright, Page, Browser
 import config
 
@@ -53,31 +54,59 @@ async def get_page_content(page: Page, url: str, quiet: bool = False) -> dict | 
 
 # ── Staff page detection ──
 
-def _is_staff_page(text: str) -> bool:
+def _is_staff_page(text: str, page_url: str = "") -> bool:
     """Heuristic: is this actually a staff/faculty listing page?"""
     text_lower = text.lower()
+    url_lower = page_url.lower()
 
     # Must have strong staff indicators
     strong = ["staff directory", "faculty directory", "our staff",
               "our faculty", "staff list", "faculty & staff",
               "faculty and staff", "meet our staff", "meet our teachers"]
     has_strong = any(kw in text_lower for kw in strong)
+    has_strong_url = any(kw in url_lower for kw in [
+        "staff", "faculty", "directory", "staff-directory",
+        "staffsearch", "staff-search", "teacher", "employee",
+    ])
 
     # Or multiple weak indicators
     weak = ["teacher", "staff", "faculty", "instructor", "educator",
             "department head"]
     weak_count = sum(1 for kw in weak if kw in text_lower)
+    directory_controls = sum(
+        1 for kw in [
+            "search staff", "staff search", "first name", "last name",
+            "all locations", "all departments", "filter by", "directory results",
+        ]
+        if kw in text_lower
+    )
+    negative_content = sum(
+        1 for kw in [
+            "how to", "help guide", "teacher help", "acceptable use agreement",
+            "powerteacher", "powerschool", "schoolmessenger",
+            "grading", "scoresheet", "category weighting", "current topics",
+            "submit grades", "technology support",
+        ]
+        if kw in text_lower
+    )
 
     email_count = len(re.findall(config.EMAIL_REGEX, text))
     phone_count = len(re.findall(r'[\(]?\d{3}[\)]?[\s\-\.]\d{3}[\s\-\.]\d{4}', text))
+    name_like_count = len(re.findall(
+        r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z\'\-]+){1,2}\b',
+        text[:120000],
+    ))
 
-    if has_strong and (email_count >= 3 or phone_count >= 3):
+    if has_strong and (email_count >= 1 or phone_count >= 2 or name_like_count >= 8):
         return True
-    if weak_count >= 2 and email_count >= 5:
+    # Directory UIs often hide emails but still have many names and filter controls.
+    if directory_controls >= 2 and (name_like_count >= 6 or email_count >= 2):
         return True
-    # Also match pages with many emails and some staff-like content
-    if email_count >= 3 and weak_count >= 1:
+    if has_strong_url and weak_count >= 1 and (email_count >= 2 or phone_count >= 2 or name_like_count >= 10):
         return True
+    # Avoid false positives from teacher help/training pages.
+    if negative_content >= 2 and not has_strong and directory_controls == 0:
+        return False
     return False
 
 
@@ -88,6 +117,7 @@ def _score_link(href: str, text: str) -> int:
     score = 0
     href_lower = href.lower()
     text_lower = text.lower().strip()
+    anchor_words = text_lower.split()
 
     # High value: explicit staff/faculty directory links
     high = ["staff directory", "faculty directory", "our staff",
@@ -103,6 +133,12 @@ def _score_link(href: str, text: str) -> int:
         if kw == text_lower or kw in href_lower:
             score += 8
 
+    for kw in config.STAFF_LINK_POSITIVE_HINTS:
+        if kw in text_lower:
+            score += 4
+        if f"/{kw}" in href_lower:
+            score += 4
+
     # STEM departments
     for kw in ["science", "math", "stem"]:
         if kw in text_lower or kw in href_lower:
@@ -114,16 +150,17 @@ def _score_link(href: str, text: str) -> int:
             score += 8
 
     # Kill non-relevant links
-    negative = ["calendar", "news", "event", "lunch", "menu", "bus",
-                "parent", "student", "enrollment", "login", "donate",
-                "careers", "jobs", "apply", "employment", "twitter",
-                "facebook", "instagram", "youtube", ".pdf", ".doc",
-                "mailto:", "tel:", "javascript:", "curriculum",
-                "assessment", "grants", "literacy", "resources",
-                "choice", "design", "journey"]
-    for kw in negative:
+    for kw in config.STAFF_LINK_NEGATIVE_HINTS:
         if kw in href_lower or kw in text_lower:
             score -= 15
+
+    # Penalize long sentence-like anchors that are usually article content.
+    if len(anchor_words) >= 8:
+        score -= 6
+
+    # Homepage/self links are rarely useful as staff candidates.
+    if href_lower.endswith("/") and text_lower in {"home", "district home", ""}:
+        score -= 20
 
     return score
 
@@ -134,19 +171,32 @@ async def find_staff_pages(page: Page, start_url: str) -> list[str]:
     """Find staff/faculty/directory pages by checking homepage links first."""
     parsed = urlparse(start_url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
+    start_normalized = _normalize_url(start_url)
 
-    staff_pages = []
+    staff_pages: list[str] = []
+    staff_page_set: set[str] = set()
+    checked_urls: set[str] = set()
+
+    def add_staff_page(url: str):
+        normalized = _normalize_url(url)
+        if normalized and normalized not in staff_page_set:
+            staff_page_set.add(normalized)
+            staff_pages.append(normalized)
 
     # Phase 1: Load homepage and find staff links from navigation
     print(f"  🔍 Checking homepage for staff links...")
     content = await get_page_content(page, start_url, quiet=True)
     if content:
-        if _is_staff_page(content["text"]):
+        if _is_staff_page(content["text"], start_url):
             print(f"    🎯 Start URL is a staff page!")
-            staff_pages.append(start_url)
+            add_staff_page(start_url)
+            # Fast path: when user passes a concrete staff-directory URL directly,
+            # skip expensive extra discovery phases.
+            if _is_direct_staff_directory_url(start_url):
+                return [start_normalized]
 
         links = await _get_links(page)
-        scored = []
+        scored: dict[str, tuple[int, str]] = {}
         for link in links:
             href = link.get("href", "")
             text = link.get("text", "")
@@ -156,42 +206,213 @@ async def find_staff_pages(page: Page, start_url: str) -> list[str]:
                     continue
             except Exception:
                 continue
-            full = urljoin(start_url, href).split('#')[0].rstrip('/')
+            full = _normalize_url(urljoin(start_url, href))
+            if full == start_normalized:
+                continue
+            if not _is_staff_candidate_url(full):
+                continue
             s = _score_link(href, text)
             if s >= config.MIN_LINK_SCORE and full not in staff_pages:
-                scored.append((s, full, text))
+                previous = scored.get(full)
+                if not previous or s > previous[0]:
+                    scored[full] = (s, text)
 
-        scored.sort(key=lambda x: x[0], reverse=True)
+        scored_links = sorted(
+            [(s, full, text) for full, (s, text) in scored.items()],
+            key=lambda x: x[0],
+            reverse=True,
+        )
 
         # Visit top-scored links
         visited = {start_url}
-        for s, link_url, link_text in scored[:config.MAX_STAFF_LINK_CHECKS]:
+        for s, link_url, link_text in scored_links[:config.MAX_STAFF_LINK_CHECKS]:
             if link_url in visited:
                 continue
             visited.add(link_url)
+            checked_urls.add(link_url)
             print(f"    📋 [{s}] {link_text[:50]} → {link_url}")
             c = await get_page_content(page, link_url, quiet=True)
-            if c and _is_staff_page(c["text"]):
+            if c and _is_staff_page(c["text"], link_url):
                 print(f"    🎯 FOUND: {link_url}")
-                if link_url not in staff_pages:
-                    staff_pages.append(link_url)
+                add_staff_page(link_url)
+                if _is_direct_staff_directory_url(link_url):
+                    print("    ⚡ Using verified directory immediately")
+                    return [_normalize_url(link_url)]
             await asyncio.sleep(0.2)
 
-    # Phase 2: If nothing found, try a few common paths
+    # Phase 2: Broader same-domain discovery crawl for hidden staff links
+    discovered = await _discover_staff_pages(
+        page=page,
+        start_url=start_url,
+        domain=parsed.netloc,
+        previsited=checked_urls,
+    )
+    for url in discovered:
+        add_staff_page(url)
+    preferred_discovered = _best_direct_directory(staff_pages)
+    if preferred_discovered:
+        print("    ⚡ Using verified directory immediately")
+        return [preferred_discovered]
+
+    # Phase 3: Sitemap discovery catches hidden CMS directory URLs.
+    sitemap_urls = await _discover_staff_urls_from_sitemap(page, start_url, parsed.netloc)
+    for url in sitemap_urls:
+        add_staff_page(url)
+
+    # Phase 4: Try common paths (runs even if we found some pages)
+    print(f"  🔍 Trying common staff paths...")
+    for path in config.STAFF_URL_PATTERNS:
+        test_url = _normalize_url(base_url + path)
+        if test_url in staff_page_set:
+            continue
+        content = await get_page_content(page, test_url, quiet=True)
+        if content and _is_staff_page(content["text"], test_url):
+            print(f"    🎯 FOUND: {test_url}")
+            add_staff_page(test_url)
+            if _is_direct_staff_directory_url(test_url):
+                print("    ⚡ Using verified directory immediately")
+                return [test_url]
+        await asyncio.sleep(0.2)
+
+    # Phase 5: If still nothing, keep highest-scored candidates as fallback.
     if not staff_pages:
-        print(f"  🔍 Trying common staff paths...")
-        for path in config.STAFF_URL_PATTERNS:
-            test_url = base_url + path
-            if test_url in staff_pages:
-                continue
-            content = await get_page_content(page, test_url, quiet=True)
-            if content and _is_staff_page(content["text"]):
-                print(f"    🎯 FOUND: {test_url}")
-                staff_pages.append(test_url)
-                break
-            await asyncio.sleep(0.2)
+        print(f"  🔍 Using top scored link fallbacks...")
+        fallback_urls = await _discover_fallback_candidates(page, start_url, parsed.netloc)
+        for u in fallback_urls:
+            add_staff_page(u)
 
-    return list(dict.fromkeys(staff_pages))
+    ranked = sorted(staff_pages, key=_staff_url_priority, reverse=True)
+    return ranked[:config.MAX_STAFF_LINK_CHECKS]
+
+
+async def _discover_staff_pages(page: Page, start_url: str, domain: str,
+                                previsited: set[str] | None = None) -> list[str]:
+    """Breadth-first discovery for hidden staff directory links."""
+    previsited = previsited or set()
+    queue = deque([(start_url, 0)])
+    seen = {_normalize_url(start_url)}
+    visited_count = 0
+    found: list[str] = []
+    found_set: set[str] = set()
+
+    print("  🔎 Deep discovery crawl for staff pages...")
+    while queue and visited_count < config.MAX_DISCOVERY_VISITS:
+        current_url, depth = queue.popleft()
+        current_url = _normalize_url(current_url)
+        if not current_url or current_url in previsited:
+            continue
+        if not _is_same_domain(current_url, domain):
+            continue
+
+        visited_count += 1
+        content = await get_page_content(page, current_url, quiet=True)
+        if not content:
+            continue
+
+        if (
+            _is_staff_page(content["text"], current_url)
+            and _is_staff_candidate_url(current_url)
+            and current_url not in found_set
+        ):
+            found_set.add(current_url)
+            found.append(current_url)
+            print(f"    🎯 FOUND (discovery): {current_url}")
+
+        if depth >= config.MAX_CRAWL_DEPTH:
+            continue
+
+        links = await _get_links(page)
+        for link in links:
+            href = link.get("href", "")
+            text = link.get("text", "")
+            full = _normalize_url(urljoin(current_url, href))
+            if not full or full in seen:
+                continue
+            if not _is_same_domain(full, domain):
+                continue
+            if not _is_staff_candidate_url(full) and not (depth == 0 and _is_nav_hub_link(href, text)):
+                continue
+
+            score = _score_link(href, text)
+            should_enqueue = False
+            if score >= config.SECONDARY_LINK_SCORE and _is_staff_candidate_url(full):
+                should_enqueue = True
+            elif depth == 0 and _is_nav_hub_link(href, text):
+                should_enqueue = True
+
+            if should_enqueue:
+                seen.add(full)
+                queue.append((full, depth + 1))
+
+    return found
+
+
+async def _discover_staff_urls_from_sitemap(page: Page, start_url: str, domain: str) -> list[str]:
+    """Read common sitemap files and extract staff-like URLs."""
+    parsed = urlparse(start_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    pending = deque([
+        f"{base}/sitemap.xml",
+        f"{base}/sitemap_index.xml",
+        f"{base}/wp-sitemap.xml",
+    ])
+    fetched: set[str] = set()
+    found: set[str] = set()
+
+    print("  🗺️ Checking sitemap for staff URLs...")
+    while pending and len(fetched) < config.MAX_SITEMAP_FETCHES:
+        sitemap_url = _normalize_url(pending.popleft())
+        if not sitemap_url or sitemap_url in fetched:
+            continue
+        fetched.add(sitemap_url)
+
+        try:
+            resp = await page.goto(
+                sitemap_url,
+                wait_until="domcontentloaded",
+                timeout=config.PAGE_TIMEOUT,
+            )
+            if not resp or resp.status >= 400:
+                continue
+            raw = await page.content()
+        except Exception:
+            continue
+
+        for loc in _extract_xml_locs(raw):
+            normalized = _normalize_url(loc)
+            if not normalized or not _is_same_domain(normalized, domain):
+                continue
+            if ".xml" in normalized.lower() and "sitemap" in normalized.lower():
+                if normalized not in fetched:
+                    pending.append(normalized)
+                continue
+            if _is_staff_candidate_url(normalized):
+                found.add(normalized)
+
+    if found:
+        print(f"    🎯 Found {len(found)} staff-like URL(s) via sitemap")
+    return sorted(found, key=_staff_url_priority, reverse=True)[:config.MAX_STAFF_LINK_CHECKS]
+
+
+async def _discover_fallback_candidates(page: Page, start_url: str, domain: str) -> list[str]:
+    """Return top same-domain staff-like links even if content check is inconclusive."""
+    content = await get_page_content(page, start_url, quiet=True)
+    if not content:
+        return []
+    links = await _get_links(page)
+    scored: dict[str, int] = {}
+    for link in links:
+        href = link.get("href", "")
+        text = link.get("text", "")
+        full = _normalize_url(urljoin(start_url, href))
+        if not full or not _is_same_domain(full, domain):
+            continue
+        if not _is_staff_candidate_url(full):
+            continue
+        score = _score_link(href, text)
+        if score >= config.MIN_LINK_SCORE:
+            scored[full] = max(score, scored.get(full, -999))
+    return [u for u, _ in sorted(scored.items(), key=lambda x: x[1], reverse=True)[:3]]
 
 
 async def scrape_paginated_directory(page: Page, url: str) -> list[dict]:
@@ -404,6 +625,105 @@ async def _get_links(page: Page) -> list[dict]:
         return []
 
 
+def _normalize_url(url: str) -> str:
+    """Normalize URL for deduplication and same-page comparisons."""
+    normalized = (url or "").split("#")[0].strip()
+    if not normalized:
+        return ""
+    return normalized.rstrip("/")
+
+
+def _is_same_domain(url: str, domain: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            return True
+        lhs = parsed.netloc.lower().removeprefix("www.")
+        rhs = domain.lower().removeprefix("www.")
+        return lhs == rhs
+    except Exception:
+        return False
+
+
+def _is_nav_hub_link(href: str, text: str) -> bool:
+    """Identify navigation-hub pages likely to contain nested directory links."""
+    combined = f"{href} {text}".lower()
+    if any(bad in combined for bad in ["board", "calendar", "news", "employment", "jobs"]):
+        return False
+    hubs = [
+        "about", "our schools", "schools", "academics", "departments",
+        "campus", "directory", "staff", "faculty",
+    ]
+    return any(h in combined for h in hubs)
+
+
+def _staff_url_priority(url: str) -> int:
+    lowered = url.lower()
+    score = 0
+    if "staff-directory" in lowered:
+        score += 30
+    if "/staff" in lowered:
+        score += 25
+    if "/faculty" in lowered:
+        score += 20
+    if "/directory" in lowered:
+        score += 15
+    if "staff-search" in lowered or "staffsearch" in lowered:
+        score += 12
+    if "/teacher" in lowered:
+        score += 8
+    if "/people" in lowered:
+        score += 4
+    return score
+
+
+def _is_direct_staff_directory_url(url: str) -> bool:
+    """Return True when URL itself is an explicit staff-directory target."""
+    normalized = _normalize_url(url)
+    if not normalized:
+        return False
+    parsed = urlparse(normalized)
+    path = (parsed.path or "").lower()
+    if path in {"", "/"}:
+        return False
+    return _staff_url_priority(normalized) >= 20 and _is_staff_candidate_url(normalized)
+
+
+def _best_direct_directory(urls: list[str]) -> str | None:
+    """Pick the strongest direct staff-directory URL from discovered pages."""
+    direct = [u for u in urls if _is_direct_staff_directory_url(u)]
+    if not direct:
+        return None
+    return sorted(direct, key=_staff_url_priority, reverse=True)[0]
+
+
+def _is_staff_candidate_url(url: str) -> bool:
+    """Filter to URLs likely to be actual staff directories, not staff documents."""
+    lowered = url.lower()
+    include_markers = [
+        "staff-directory", "staff-search", "staffsearch",
+        "/directory", "/faculty", "/teachers", "/teacher",
+        "/page/staff", "/page/faculty", "/people/staff",
+    ]
+    exclude_markers = [
+        "/documents/", "/doc/", "/files/", "/news/", "/events/",
+        "/for-current-staff", "/current-staff", "/join-our-team",
+        "/salary", "/benefits", "/wellness", "/recruitment", "/retention",
+        "/employment", "/jobs", "/forms", "/handbook", "/policies",
+        "/board", "/calendar", "/contact-hr",
+    ]
+    if any(marker in lowered for marker in exclude_markers):
+        return False
+    if any(marker in lowered for marker in include_markers):
+        return True
+    return _staff_url_priority(url) >= 15
+
+
+def _extract_xml_locs(xml_text: str) -> list[str]:
+    """Extract URL values from <loc> tags in XML sitemap content."""
+    return re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml_text, flags=re.IGNORECASE)
+
+
 async def find_profile_links(page: Page, base_domain: str) -> list[str]:
     """Find individual teacher profile page links."""
     links = await _get_links(page)
@@ -455,6 +775,77 @@ async def get_contact_page(page: Page, start_url: str) -> dict | None:
     return None
 
 
+async def _handle_google_consent(page: Page) -> None:
+    """Accept Google consent dialog when present."""
+    consent_selectors = [
+        'button:has-text("I agree")',
+        'button:has-text("Accept all")',
+        'button:has-text("Accept everything")',
+        'button:has-text("Agree")',
+        'form[action*="consent"] button[type="submit"]',
+        'input[type="submit"][value*="I agree"]',
+    ]
+    for selector in consent_selectors:
+        try:
+            el = page.locator(selector).first
+            if await el.is_visible(timeout=750):
+                await el.click()
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(800)
+                return
+        except Exception:
+            continue
+
+
+def _normalize_google_result_url(url: str) -> str:
+    """Normalize Google redirect URLs to their destination."""
+    if not url:
+        return ""
+    cleaned = url.strip()
+    parsed = urlparse(cleaned)
+
+    if "google." in parsed.netloc and parsed.path.startswith("/url"):
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        target = query.get("q", "")
+        if target:
+            cleaned = unquote(target)
+
+    cleaned = cleaned.split("#")[0]
+    if "?" in cleaned:
+        cleaned = cleaned.split("?", 1)[0]
+    return cleaned.rstrip("/")
+
+
+async def _extract_google_items(page: Page) -> list[dict]:
+    """Extract Google organic result cards with robust selectors."""
+    try:
+        return await page.evaluate("""() => {
+            const results = [];
+            const containers = document.querySelectorAll('div.g, div.MjjYud, div[data-sokoban-container]');
+            for (const el of containers) {
+                const a = el.querySelector('a[href]');
+                const h = el.querySelector('h3, [role="heading"]');
+                if (!a || !h) continue;
+                const snippet =
+                    el.querySelector('.VwiC3b') ||
+                    el.querySelector('.st') ||
+                    el.querySelector('[data-sncf]') ||
+                    el.querySelector('.MUxGbd');
+                const title = (h.innerText || '').trim();
+                const url = (a.href || '').trim();
+                if (!title || !url) continue;
+                results.push({
+                    url,
+                    title,
+                    snippet: snippet ? (snippet.innerText || '').trim() : ''
+                });
+            }
+            return results;
+        }""")
+    except Exception:
+        return []
+
+
 async def google_search_teachers(page: Page, school_name: str,
                                   domain: str) -> list[dict]:
     """Search Google for teacher info. Returns enrichment data."""
@@ -467,30 +858,31 @@ async def google_search_teachers(page: Page, school_name: str,
 
     for query in queries:
         try:
-            search_url = f"https://www.google.com/search?q={query}&num=15"
+            encoded_query = quote_plus(query)
+            search_url = (
+                "https://www.google.com/search"
+                f"?hl=en&gl=us&num=20&pws=0&q={encoded_query}"
+            )
             print(f"    🔎 Google: {query[:60]}...")
             resp = await page.goto(search_url, wait_until="domcontentloaded",
-                                   timeout=10000)
+                                    timeout=10000)
             if not resp or resp.status >= 400:
                 continue
-            await page.wait_for_timeout(config.GOOGLE_RENDER_WAIT)
 
-            items = await page.evaluate("""() => {
-                const r = [];
-                document.querySelectorAll('div.g, div[data-sokoban-container]').forEach(el => {
-                    const a = el.querySelector('a');
-                    const h = el.querySelector('h3');
-                    const s = el.querySelector('.VwiC3b, .st, [data-sncf]');
-                    if (a && h) r.push({
-                        url: a.href, title: h.innerText,
-                        snippet: s ? s.innerText : ''
-                    });
-                });
-                return r;
-            }""")
+            await _handle_google_consent(page)
+            await page.wait_for_timeout(config.GOOGLE_RENDER_WAIT)
+            current_url = (page.url or "").lower()
+            if "sorry/index" in current_url or "/recaptcha/" in current_url:
+                print("    ⚠️  Google blocked this query (captcha/anti-bot)")
+                continue
+
+            items = await _extract_google_items(page)
+            if not items:
+                print("    ⚠️  Google returned no parseable results")
+                continue
 
             for item in items:
-                url = item.get("url", "")
+                url = _normalize_google_result_url(item.get("url", ""))
                 title = item.get("title", "")
                 snippet = item.get("snippet", "")
                 if "linkedin.com/in/" in url:
