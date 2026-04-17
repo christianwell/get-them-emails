@@ -18,6 +18,7 @@ def is_stem_teacher(teacher: dict) -> bool:
     dept = (teacher.get("department") or "").lower()
     bio = (teacher.get("bio") or "").lower()
     source_url = (teacher.get("source_url") or "").lower()
+
     combined = f"{role} {dept} {bio} {source_url}"
 
     for keyword in config.STEM_KEYWORDS:
