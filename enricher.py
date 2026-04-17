@@ -41,12 +41,17 @@ def is_stem_teacher(teacher: dict) -> bool:
         "tech ed", "data science", "cyber", "makerspace",
     }
 
+    def has_term(haystack: str, term: str) -> bool:
+        # Match whole words/phrases so "physics" doesn't match "physical".
+        pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+        return bool(re.search(pattern, haystack))
+
     for keyword in strong_keywords:
-        if keyword in role_dept_bio:
+        if has_term(role_dept_bio, keyword):
             return True
 
     for keyword in broad_keywords:
-        if keyword in role_dept_bio and has_educator_signal:
+        if has_term(role_dept_bio, keyword) and has_educator_signal:
             return True
 
     if page_subject_hint in {"math", "science", "stem"}:
