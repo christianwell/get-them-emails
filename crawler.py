@@ -100,7 +100,7 @@ def _score_link(href: str, text: str) -> int:
     # Medium value
     medium = ["staff", "faculty", "directory", "teachers", "team"]
     for kw in medium:
-        if kw == text_lower or kw in href_lower.split('/'):
+        if kw == text_lower or kw in href_lower:
             score += 8
 
     # STEM departments
@@ -180,7 +180,7 @@ async def find_staff_pages(page: Page, start_url: str) -> list[str]:
     # Phase 2: If nothing found, try a few common paths
     if not staff_pages:
         print(f"  🔍 Trying common staff paths...")
-        for path in config.STAFF_URL_PATTERNS[:6]:
+        for path in config.STAFF_URL_PATTERNS:
             test_url = base_url + path
             if test_url in staff_pages:
                 continue

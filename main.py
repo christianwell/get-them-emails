@@ -32,19 +32,9 @@ from exporter import export_csv
 
 
 def rank_teacher_for_output(teacher: dict, domain: str) -> tuple[int, str]:
-    """Rank teachers so key validation names and strongest STEM roles surface first."""
-    name = (teacher.get("name") or "").lower().strip()
+    """Rank teachers so strongest STEM roles surface first."""
     role = (teacher.get("role") or "").lower()
     score = 0
-
-    # Domain-specific validation names should be highly visible.
-    if domain == "cvsdvt.org":
-        if "charlie" in name:
-            score += 1000
-        if "olaf" in name:
-            score += 900
-    if domain == "sbhs.sbschools.net" and "nathaniel moore" in name:
-        score += 1000
 
     if "stem" in role:
         score += 80

@@ -236,11 +236,16 @@ def parse_staff_from_html(html: str, page_url: str = "") -> list[dict]:
 def extract_school_address(html: str) -> dict:
     """Use LLM to extract school address from page."""
     client = get_ai_client()
-    text = clean_html(html)
+    # Use full page text (not clean_html) since addresses are often in
+    # headers/footers that clean_html strips out.
+    soup = BeautifulSoup(html, 'lxml')
+    for tag in soup.find_all(['script', 'style', 'noscript', 'iframe', 'svg']):
+        tag.decompose()
+    text = soup.get_text(separator='\n', strip=True)
+    text = re.sub(r'\n{3,}', '\n\n', text)
 
     # Address is usually near top or bottom
     if len(text) > config.HTML_CHUNK_SIZE:
-        # Take beginning and end
         text = text[:config.HTML_CHUNK_SIZE // 2] + "\n...\n" + text[-config.HTML_CHUNK_SIZE // 2:]
 
     prompt = config.SCHOOL_ADDRESS_PROMPT + f"\n\nContent:\n{text}"
